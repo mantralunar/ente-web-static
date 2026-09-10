@@ -8,6 +8,9 @@ on:
         required: true
         default: "main"
 
+  schedule:
+    - cron: "17 4 * * *"
+
 permissions:
   contents: write
 
@@ -15,15 +18,54 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
+    env:
+      GH_REPO: ${{ github.repository }}
+
     steps:
       - name: Checkout Ente source
         uses: actions/checkout@v6
         with:
           repository: ente-io/ente
-          ref: ${{ inputs.ente_ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ente_ref || 'main' }}
           path: ente
 
+      - name: Determine build version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ENTE_REF="${{ github.event_name == 'workflow_dispatch' && inputs.ente_ref || 'main' }}"
+          UPSTREAM_SHA=$(git -C ente rev-parse HEAD)
+          SHORT_SHA=$(git -C ente rev-parse --short=12 HEAD)
+          BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          VERSION="$(date -u +"%Y.%m.%d")-${SHORT_SHA}-b${GITHUB_RUN_NUMBER}"
+          TAG="ente-web-${VERSION}"
+
+          echo "ente_ref=$ENTE_REF" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "build_date=$BUILD_DATE" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          SKIP=false
+
+          if [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
+            LATEST_BODY=$(gh release view \
+              --repo "$GH_REPO" \
+              --json body \
+              --jq '.body' 2>/dev/null || true)
+
+            if printf '%s\n' "$LATEST_BODY" | grep -Fq "Upstream commit: \`$UPSTREAM_SHA\`"; then
+              echo "Latest release already contains upstream commit $UPSTREAM_SHA"
+              SKIP=true
+            fi
+          fi
+
+          echo "skip=$SKIP" >> "$GITHUB_OUTPUT"
+
       - name: Set up Node
+        if: steps.version.outputs.skip != 'true'
         uses: actions/setup-node@v6
         with:
           node-version: "24"
@@ -31,15 +73,46 @@ jobs:
           cache-dependency-path: ente/web/package-lock.json
 
       - name: Install Rust
+        if: steps.version.outputs.skip != 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
 
+      - name: Cache Rust
+        if: steps.version.outputs.skip != 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            ente/rust -> target
+          shared-key: ente-web
+
+      - name: Cache Next.js
+        if: steps.version.outputs.skip != 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ente/web/apps/photos/.next/cache
+            ente/web/apps/albums/.next/cache
+            ente/web/apps/accounts/.next/cache
+            ente/web/apps/auth/.next/cache
+            ente/web/apps/cast/.next/cache
+            ente/web/apps/share/.next/cache
+            ente/web/apps/embed/.next/cache
+            ente/web/apps/paste/.next/cache
+            ente/web/apps/locker/.next/cache
+            ente/web/apps/memories/.next/cache
+          key: ${{ runner.os }}-nextjs-${{ hashFiles('ente/web/package-lock.json') }}-${{ steps.version.outputs.upstream_sha }}
+          restore-keys: |
+            ${{ runner.os }}-nextjs-${{ hashFiles('ente/web/package-lock.json') }}-
+            ${{ runner.os }}-nextjs-
+
       - name: Install dependencies
+        if: steps.version.outputs.skip != 'true'
         working-directory: ente/web
         run: npm ci
 
       - name: Build Ente web apps
+        if: steps.version.outputs.skip != 'true'
         working-directory: ente/web
         env:
           NEXT_PUBLIC_ENTE_ENDPOINT: ENTE_API_ORIGIN_PLACEHOLDER
@@ -55,14 +128,21 @@ jobs:
           npm run build:locker
           npm run build:memories
 
-      - name: Verify API placeholder exists
+      - name: Verify API placeholder
+        if: steps.version.outputs.skip != 'true'
         run: |
           if ! grep -R -q "ENTE_API_ORIGIN_PLACEHOLDER" ente/web/apps/*/out; then
             echo "ERROR: ENTE_API_ORIGIN_PLACEHOLDER was not found."
             exit 1
           fi
 
-      - name: Prepare static web package
+      - name: Prepare release
+        if: steps.version.outputs.skip != 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          ENTE_REF: ${{ steps.version.outputs.ente_ref }}
+          UPSTREAM_SHA: ${{ steps.version.outputs.upstream_sha }}
+          BUILD_DATE: ${{ steps.version.outputs.build_date }}
         run: |
           mkdir -p release
 
@@ -77,19 +157,44 @@ jobs:
           cp -a ente/web/apps/locker/out release/locker
           cp -a ente/web/apps/memories/out release/memories
 
+          cat > release/BUILD-INFO.txt <<EOF
+          Ente Web Static
+          Version: $VERSION
+          Upstream ref: $ENTE_REF
+          Upstream commit: $UPSTREAM_SHA
+          Built: $BUILD_DATE
+          API placeholder: ENTE_API_ORIGIN_PLACEHOLDER
+          EOF
+
           tar -C release -czf ente-web-static.tar.gz .
 
+          sha256sum ente-web-static.tar.gz > SHA256SUMS
+
       - name: Create GitHub release
+        if: steps.version.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          ENTE_REF: ${{ inputs.ente_ref }}
-          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+          ENTE_REF: ${{ steps.version.outputs.ente_ref }}
+          UPSTREAM_SHA: ${{ steps.version.outputs.upstream_sha }}
+          BUILD_DATE: ${{ steps.version.outputs.build_date }}
         run: |
-          SAFE_REF=$(printf '%s' "$ENTE_REF" | tr '/:' '--')
-          TAG="ente-web-${SAFE_REF}-${GITHUB_RUN_NUMBER}"
+          cat > release-notes.md <<EOF
+          Generic static Ente web build.
+
+          Upstream ref: \`$ENTE_REF\`
+          Upstream commit: \`$UPSTREAM_SHA\`
+          Build version: \`$VERSION\`
+          Built: \`$BUILD_DATE\`
+
+          \`ENTE_API_ORIGIN_PLACEHOLDER\` has intentionally not been replaced.
+          EOF
 
           gh release create "$TAG" \
             ente-web-static.tar.gz \
+            SHA256SUMS \
             --repo "$GH_REPO" \
-            --title "Ente Web Static — $ENTE_REF" \
-            --notes "Generic static Ente web build from ente-io/ente ref: $ENTE_REF. ENTE_API_ORIGIN_PLACEHOLDER has intentionally not been replaced."
+            --latest \
+            --title "Ente Web Static — $VERSION" \
+            --notes-file release-notes.md
