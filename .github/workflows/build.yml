@@ -79,12 +79,6 @@ jobs:
 
           tar -C release -czf ente-web-static.tar.gz .
 
-      - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ente-web-static
-          path: ente-web-static.tar.gz
-
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
