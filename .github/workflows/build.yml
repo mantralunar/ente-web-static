@@ -1,0 +1,99 @@
+name: Build Ente Web Static
+
+on:
+  workflow_dispatch:
+    inputs:
+      ente_ref:
+        description: "Ente branch, tag or commit to build"
+        required: true
+        default: "main"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Ente source
+        uses: actions/checkout@v6
+        with:
+          repository: ente-io/ente
+          ref: ${{ inputs.ente_ref }}
+          path: ente
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: ente/web/package-lock.json
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install dependencies
+        working-directory: ente/web
+        run: npm ci
+
+      - name: Build Ente web apps
+        working-directory: ente/web
+        env:
+          NEXT_PUBLIC_ENTE_ENDPOINT: ENTE_API_ORIGIN_PLACEHOLDER
+        run: |
+          npm run build:photos
+          npm run build:albums
+          npm run build:accounts
+          npm run build:auth
+          npm run build:cast
+          npm run build:share
+          npm run build:embed
+          npm run build:paste
+          npm run build:locker
+          npm run build:memories
+
+      - name: Verify API placeholder exists
+        run: |
+          if ! grep -R -q "ENTE_API_ORIGIN_PLACEHOLDER" ente/web/apps/*/out; then
+            echo "ERROR: ENTE_API_ORIGIN_PLACEHOLDER was not found."
+            exit 1
+          fi
+
+      - name: Prepare static web package
+        run: |
+          mkdir -p release
+
+          cp -a ente/web/apps/photos/out release/photos
+          cp -a ente/web/apps/albums/out release/albums
+          cp -a ente/web/apps/accounts/out release/accounts
+          cp -a ente/web/apps/auth/out release/auth
+          cp -a ente/web/apps/cast/out release/cast
+          cp -a ente/web/apps/share/out release/share
+          cp -a ente/web/apps/embed/out release/embed
+          cp -a ente/web/apps/paste/out release/paste
+          cp -a ente/web/apps/locker/out release/locker
+          cp -a ente/web/apps/memories/out release/memories
+
+          tar -C release -czf ente-web-static.tar.gz .
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ente-web-static
+          path: ente-web-static.tar.gz
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ENTE_REF: ${{ inputs.ente_ref }}
+        run: |
+          SAFE_REF=$(printf '%s' "$ENTE_REF" | tr '/:' '--')
+          TAG="ente-web-${SAFE_REF}-${GITHUB_RUN_NUMBER}"
+
+          gh release create "$TAG" \
+            ente-web-static.tar.gz \
+            --title "Ente Web Static — $ENTE_REF" \
+            --notes "Generic static Ente web build from ente-io/ente ref: $ENTE_REF. ENTE_API_ORIGIN_PLACEHOLDER has intentionally not been replaced."
