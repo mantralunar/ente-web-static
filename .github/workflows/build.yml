@@ -89,11 +89,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           ENTE_REF: ${{ inputs.ente_ref }}
+          GH_REPO: ${{ github.repository }}
         run: |
           SAFE_REF=$(printf '%s' "$ENTE_REF" | tr '/:' '--')
           TAG="ente-web-${SAFE_REF}-${GITHUB_RUN_NUMBER}"
 
           gh release create "$TAG" \
             ente-web-static.tar.gz \
+            --repo "$GH_REPO" \
             --title "Ente Web Static — $ENTE_REF" \
             --notes "Generic static Ente web build from ente-io/ente ref: $ENTE_REF. ENTE_API_ORIGIN_PLACEHOLDER has intentionally not been replaced."
