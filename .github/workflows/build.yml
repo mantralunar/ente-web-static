@@ -2,17 +2,17 @@ name: Build Ente Web Static
 
 on:
   workflow_dispatch:
-    inputs:
-      ente_ref:
-        description: "Ente branch, tag or commit to build"
-        required: true
-        default: "main"
 
   schedule:
     - cron: "17 4 * * *"
 
 permissions:
   contents: write
+  packages: read
+
+concurrency:
+  group: ente-web-static
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -20,52 +20,172 @@ jobs:
 
     env:
       GH_REPO: ${{ github.repository }}
+      ENTE_IMAGE: ghcr.io/ente/web
 
     steps:
-      - name: Checkout Ente source
-        uses: actions/checkout@v6
-        with:
-          repository: ente-io/ente
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ente_ref || 'main' }}
-          path: ente
+      # -----------------------------------------------------------------------
+      # Determine which Ente web package is currently published as "latest".
+      #
+      # Ente publishes the source commit SHA alongside the "latest" tag,
+      # e.g.
+      #
+      #   latest
+      #   86d67574787055d13512d15f19089f66c5fe1f96
+      #
+      # on the same GHCR package version.
+      # -----------------------------------------------------------------------
 
-      - name: Determine build version
-        id: version
+      - name: Determine published Ente web version
+        id: upstream
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          ENTE_REF="${{ github.event_name == 'workflow_dispatch' && inputs.ente_ref || 'main' }}"
-          UPSTREAM_SHA=$(git -C ente rev-parse HEAD)
-          SHORT_SHA=$(git -C ente rev-parse --short=12 HEAD)
-          BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          VERSION="$(date -u +"%Y.%m.%d")-${SHORT_SHA}-b${GITHUB_RUN_NUMBER}"
-          TAG="ente-web-${VERSION}"
+          set -euo pipefail
 
-          echo "ente_ref=$ENTE_REF" >> "$GITHUB_OUTPUT"
+          LATEST_JSON="$(
+            gh api \
+              '/users/ente/packages/container/web/versions?per_page=100' \
+              --jq '[.[] | select(.metadata.container.tags | index("latest"))][0]'
+          )"
+
+          if [ -z "$LATEST_JSON" ] || [ "$LATEST_JSON" = "null" ]; then
+            echo "ERROR: Could not find ghcr.io/ente/web:latest"
+            exit 1
+          fi
+
+          IMAGE_DIGEST="$(
+            printf '%s\n' "$LATEST_JSON" |
+              jq -r '.name'
+          )"
+
+          UPSTREAM_SHA="$(
+            printf '%s\n' "$LATEST_JSON" |
+              jq -r '
+                [
+                  .metadata.container.tags[]
+                  | select(test("^[0-9a-f]{40}$"))
+                ][0] // empty
+              '
+          )"
+
+          if [ -z "$IMAGE_DIGEST" ] || [ "$IMAGE_DIGEST" = "null" ]; then
+            echo "ERROR: Could not determine package digest."
+            exit 1
+          fi
+
+          if ! printf '%s\n' "$IMAGE_DIGEST" |
+            grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            echo "ERROR: Unexpected image digest: $IMAGE_DIGEST"
+            exit 1
+          fi
+
+          if ! printf '%s\n' "$UPSTREAM_SHA" |
+            grep -Eq '^[0-9a-f]{40}$'; then
+            echo "ERROR: Could not determine Ente source commit from package tags."
+            echo "Package tags were:"
+            printf '%s\n' "$LATEST_JSON" |
+              jq -r '.metadata.container.tags[]'
+            exit 1
+          fi
+
+          SHORT_SHA="${UPSTREAM_SHA:0:12}"
+
+          echo "image_digest=$IMAGE_DIGEST" >> "$GITHUB_OUTPUT"
           echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
           echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
-          echo "build_date=$BUILD_DATE" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          echo "Published image: $ENTE_IMAGE:latest"
+          echo "Image digest:    $IMAGE_DIGEST"
+          echo "Source commit:   $UPSTREAM_SHA"
+
+      # -----------------------------------------------------------------------
+      # Scheduled builds stop here if this exact published package was already
+      # built.
+      #
+      # Manual workflow_dispatch runs intentionally bypass this check, allowing
+      # the current published package to be rebuilt manually if required.
+      # -----------------------------------------------------------------------
+
+      - name: Check whether package was already built
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE_DIGEST: ${{ steps.upstream.outputs.image_digest }}
+        run: |
+          set -euo pipefail
 
           SKIP=false
 
           if [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
-            LATEST_BODY=$(gh release view \
-              --repo "$GH_REPO" \
-              --json body \
-              --jq '.body' 2>/dev/null || true)
+            LATEST_BODY="$(
+              gh release view \
+                --repo "$GH_REPO" \
+                --json body \
+                --jq '.body' \
+                2>/dev/null || true
+            )"
 
-            if printf '%s\n' "$LATEST_BODY" | grep -Fq "Upstream commit: \`$UPSTREAM_SHA\`"; then
-              echo "Latest release already contains upstream commit $UPSTREAM_SHA"
+            if printf '%s\n' "$LATEST_BODY" |
+              grep -Fq "Ente web image digest: \`$IMAGE_DIGEST\`"; then
+
+              echo "Published Ente web package has already been built."
+              echo "Digest: $IMAGE_DIGEST"
               SKIP=true
+            else
+              echo "New published Ente web package detected."
             fi
+          else
+            echo "Manual run requested; forcing rebuild."
           fi
 
           echo "skip=$SKIP" >> "$GITHUB_OUTPUT"
 
+      # -----------------------------------------------------------------------
+      # Check out the exact source commit used by the published web package.
+      # -----------------------------------------------------------------------
+
+      - name: Checkout Ente source
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/checkout@v6
+        with:
+          repository: ente-io/ente
+          ref: ${{ steps.upstream.outputs.upstream_sha }}
+          path: ente
+
+      # -----------------------------------------------------------------------
+      # Generate our own release version.
+      # -----------------------------------------------------------------------
+
+      - name: Determine build version
+        if: steps.check.outputs.skip != 'true'
+        id: version
+        env:
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.upstream_sha }}
+          SHORT_SHA: ${{ steps.upstream.outputs.short_sha }}
+        run: |
+          set -euo pipefail
+
+          BUILD_DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+          VERSION="$(
+            date -u +"%Y.%m.%d"
+          )-${SHORT_SHA}-b${GITHUB_RUN_NUMBER}"
+
+          TAG="ente-web-${VERSION}"
+
+          echo "build_date=$BUILD_DATE" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          echo "Version: $VERSION"
+          echo "Tag:     $TAG"
+
+      # -----------------------------------------------------------------------
+      # Build environment
+      # -----------------------------------------------------------------------
+
       - name: Set up Node
-        if: steps.version.outputs.skip != 'true'
+        if: steps.check.outputs.skip != 'true'
         uses: actions/setup-node@v6
         with:
           node-version: "24"
@@ -73,13 +193,13 @@ jobs:
           cache-dependency-path: ente/web/package-lock.json
 
       - name: Install Rust
-        if: steps.version.outputs.skip != 'true'
+        if: steps.check.outputs.skip != 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
 
       - name: Cache Rust
-        if: steps.version.outputs.skip != 'true'
+        if: steps.check.outputs.skip != 'true'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
@@ -87,7 +207,7 @@ jobs:
           shared-key: ente-web
 
       - name: Cache Next.js
-        if: steps.version.outputs.skip != 'true'
+        if: steps.check.outputs.skip != 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -101,22 +221,33 @@ jobs:
             ente/web/apps/paste/.next/cache
             ente/web/apps/locker/.next/cache
             ente/web/apps/memories/.next/cache
-          key: ${{ runner.os }}-nextjs-${{ hashFiles('ente/web/package-lock.json') }}-${{ steps.version.outputs.upstream_sha }}
+
+          key: >-
+            ${{ runner.os }}-nextjs-${{
+              hashFiles('ente/web/package-lock.json')
+            }}-${{ steps.upstream.outputs.upstream_sha }}
+
           restore-keys: |
             ${{ runner.os }}-nextjs-${{ hashFiles('ente/web/package-lock.json') }}-
             ${{ runner.os }}-nextjs-
 
       - name: Install dependencies
-        if: steps.version.outputs.skip != 'true'
+        if: steps.check.outputs.skip != 'true'
         working-directory: ente/web
         run: npm ci
 
+      # -----------------------------------------------------------------------
+      # Static Ente build
+      # -----------------------------------------------------------------------
+
       - name: Build Ente web apps
-        if: steps.version.outputs.skip != 'true'
+        if: steps.check.outputs.skip != 'true'
         working-directory: ente/web
         env:
           NEXT_PUBLIC_ENTE_ENDPOINT: ENTE_API_ORIGIN_PLACEHOLDER
         run: |
+          set -euo pipefail
+
           npm run build:photos
           npm run build:albums
           npm run build:accounts
@@ -129,21 +260,34 @@ jobs:
           npm run build:memories
 
       - name: Verify API placeholder
-        if: steps.version.outputs.skip != 'true'
+        if: steps.check.outputs.skip != 'true'
         run: |
-          if ! grep -R -q "ENTE_API_ORIGIN_PLACEHOLDER" ente/web/apps/*/out; then
+          set -euo pipefail
+
+          if ! grep -R -q \
+            "ENTE_API_ORIGIN_PLACEHOLDER" \
+            ente/web/apps/*/out; then
+
             echo "ERROR: ENTE_API_ORIGIN_PLACEHOLDER was not found."
             exit 1
           fi
 
+          echo "API placeholder found successfully."
+
+      # -----------------------------------------------------------------------
+      # Package static build
+      # -----------------------------------------------------------------------
+
       - name: Prepare release
-        if: steps.version.outputs.skip != 'true'
+        if: steps.check.outputs.skip != 'true'
         env:
           VERSION: ${{ steps.version.outputs.version }}
-          ENTE_REF: ${{ steps.version.outputs.ente_ref }}
-          UPSTREAM_SHA: ${{ steps.version.outputs.upstream_sha }}
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.upstream_sha }}
+          IMAGE_DIGEST: ${{ steps.upstream.outputs.image_digest }}
           BUILD_DATE: ${{ steps.version.outputs.build_date }}
         run: |
+          set -euo pipefail
+
           mkdir -p release
 
           cp -a ente/web/apps/photos/out release/photos
@@ -160,30 +304,43 @@ jobs:
           cat > release/BUILD-INFO.txt <<EOF
           Ente Web Static
           Version: $VERSION
-          Upstream ref: $ENTE_REF
+          Ente web image: ghcr.io/ente/web:latest
+          Ente web image digest: $IMAGE_DIGEST
           Upstream commit: $UPSTREAM_SHA
           Built: $BUILD_DATE
           API placeholder: ENTE_API_ORIGIN_PLACEHOLDER
           EOF
 
-          tar -C release -czf ente-web-static.tar.gz .
+          tar \
+            -C release \
+            -czf ente-web-static.tar.gz \
+            .
 
-          sha256sum ente-web-static.tar.gz > SHA256SUMS
+          sha256sum \
+            ente-web-static.tar.gz \
+            > SHA256SUMS
+
+      # -----------------------------------------------------------------------
+      # GitHub release
+      # -----------------------------------------------------------------------
 
       - name: Create GitHub release
-        if: steps.version.outputs.skip != 'true'
+        if: steps.check.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}
           VERSION: ${{ steps.version.outputs.version }}
-          ENTE_REF: ${{ steps.version.outputs.ente_ref }}
-          UPSTREAM_SHA: ${{ steps.version.outputs.upstream_sha }}
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.upstream_sha }}
+          IMAGE_DIGEST: ${{ steps.upstream.outputs.image_digest }}
           BUILD_DATE: ${{ steps.version.outputs.build_date }}
         run: |
+          set -euo pipefail
+
           cat > release-notes.md <<EOF
           Generic static Ente web build.
 
-          Upstream ref: \`$ENTE_REF\`
+          Ente published image: \`ghcr.io/ente/web:latest\`
+          Ente web image digest: \`$IMAGE_DIGEST\`
           Upstream commit: \`$UPSTREAM_SHA\`
           Build version: \`$VERSION\`
           Built: \`$BUILD_DATE\`
